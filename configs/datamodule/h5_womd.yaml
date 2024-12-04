@@ -1,6 +1,7 @@
 _target_: data_modules.data_h5_womd.DataH5womd
 
-data_dir: /cluster/home/zhejzhan/scratch/h5_womd_sim_agent
+# data_dir: /media/yangyh408/4A259082626F01B9/h5_womd_sim_agent
+data_dir: /home/gz0779601/codes/DataDriven_BehaviourModels/deep_learning_model/v1.0/data/h5_womd_sim_agent
 filename_train: training
 filename_val: validation
 filename_test: testing

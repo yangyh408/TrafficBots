@@ -133,6 +133,7 @@ dmypy.json
 logs/
 runs/
 outputs/
+video*/
 wandb/
 data/
 *.pyc

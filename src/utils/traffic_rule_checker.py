@@ -111,10 +111,11 @@ class TrafficRuleChecker:
         x = as_state[:, :, 0]
         y = as_state[:, :, 1]
         # [n_batch, 1]
-        xmin = map_boundary[:, [0]]
-        xmax = map_boundary[:, [1]]
-        ymin = map_boundary[:, [2]]
-        ymax = map_boundary[:, [3]]
+        # EDIT: 扩大边界检查范围，为了适应onsite高速公路场景
+        xmin = map_boundary[:, [0]] - 2
+        xmax = map_boundary[:, [1]] + 2
+        ymin = map_boundary[:, [2]] - 2
+        ymax = map_boundary[:, [3]] + 2
         outside_map_this_step = ((x > xmax) | (x < xmin) | (y > ymax) | (y < ymin)) & as_valid
         return outside_map_this_step
 

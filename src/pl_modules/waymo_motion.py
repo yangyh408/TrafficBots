@@ -1,8 +1,11 @@
 # Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by-nc/4.0/)
 from typing import Dict, List, Optional, Tuple, Union
+import time
+import copy
 import hydra
 from pytorch_lightning import LightningModule
 import torch
+import tensorflow as tf
 from omegaconf import DictConfig
 from torch import Tensor, nn
 import wandb
@@ -22,6 +25,10 @@ from utils.vis_waymo import VisWaymo
 from data_modules.waymo_post_processing import WaymoPostProcessing
 from models.metrics.womd import WOMDMetrics
 from utils.submission import SubWOMD
+from utils.visualizer import Visualizer
+
+from data_modules.wosac_post_processing import WOSACPostProcessing
+from models.metrics.wosac import WOSACMetrics
 
 
 class WaymoMotion(LightningModule):
@@ -104,6 +111,16 @@ class WaymoMotion(LightningModule):
         # save submission files
         self.sub_womd_reactive_replay = SubWOMD(wb_artifact=wb_artifact, **sub_womd_reactive_replay)
         self.sub_womd_joint_future_pred = SubWOMD(wb_artifact=wb_artifact, **sub_womd_joint_future_pred)
+
+        self.wosac_post_processing = WOSACPostProcessing(
+            step_gt=90, 
+            step_current=10, 
+            const_vel_z_sim=True,
+            const_vel_no_sim=True,
+            w_road_edge=0.0,
+            use_wosac_col=True
+        )
+        self.wosac_metrics = WOSACMetrics("wosac")
 
     def forward(
         self,
@@ -571,7 +588,16 @@ class WaymoMotion(LightningModule):
 
         return rollout_buffer, goal_sample, goal_log_probs
 
+    """
     def validation_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict:
+        import inspect
+        stack = inspect.stack()
+        print("Call stack:")
+        for frame_info in stack:
+            print(f"File: {frame_info.filename}, Line: {frame_info.lineno}, Function: {frame_info.function}")
+
+        return
+
         require_vis_dict = batch_idx < self.hparams.n_video_batch
         batch = self.pre_processing(batch)
         input_dict = {k.split("input/")[-1]: v for k, v in batch.items() if "input/" in k}
@@ -751,6 +777,95 @@ class WaymoMotion(LightningModule):
                 k_to_log=k_to_log,
                 as_goal_prior=goal_pred,
             )
+    """
+    def validation_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict:
+        # 调整预测步长
+        self.hparams.time_step_end = 90
+
+        require_vis_dict = batch_idx < self.hparams.n_video_batch
+        batch = self.pre_processing(batch)
+        input_dict = {k.split("input/")[-1]: v for k, v in batch.items() if "input/" in k}
+        latent_post_dict = {k.split("latent_post/")[-1]: v for k, v in batch.items() if "latent_post/" in k}
+
+        input_feature_dict = self.model.encode_input_features(**input_dict)
+        latent_post_feature_dict = self.model.encode_input_features(**latent_post_dict)
+
+        # ! goal and destination
+        goal_gt, goal_valid = self.model.goal_manager.get_gt_goal(
+            agent_valid=input_dict["agent_valid"], gt_dest=batch["gt/dest"], gt_goal=batch["gt/goal"]
+        )
+        goal_pred = self.model.goal_manager.pred_goal(
+            agent_type=batch["ref/agent_type"],
+            map_type=batch["ref/map_type"],
+            agent_state=batch["ref/agent_state"],
+            **input_feature_dict,
+        )
+
+        # ! latents
+        latent_post = self.model.latent_encoder(posterior=True, **latent_post_feature_dict)
+
+        # ! reactive_replay: scene reconstruct given a complete episode, same setup as training
+        # init traffic rule checker
+        rule_checker = TrafficRuleChecker(
+            batch["map/boundary"],
+            batch["map/valid"],
+            batch["map/type"],
+            batch["map/pos"],
+            batch["map/dir"],
+            batch["tl_stop/valid"],
+            batch["tl_stop/pos"],
+            batch["tl_stop/state"],
+            batch["agent/type"],
+            batch["agent/size"],
+            batch["agent/goal"],
+            batch["agent/dest"],
+            **self.hparams.traffic_rule_checker,
+        )
+        # prepare features
+        features = {
+            "map_valid": input_feature_dict["map_feature_valid"],
+            "map_feature": input_feature_dict["map_feature"],
+            "tl_valid": input_feature_dict["tl_feature_valid"],
+            "tl_feature": input_feature_dict["tl_feature"],
+            "agent_type": batch["sc/agent_type"],
+            "agent_size": batch["sc/agent_size"],
+            # gt states for overriding
+            "agent_valid": batch["agent/valid"],
+            "vel": batch["agent/vel"],
+            "acc": batch["agent/acc"],
+            "yaw_rate": batch["agent/yaw_rate"],
+            "agent_state": torch.cat([batch["agent/pos"], batch["agent/yaw_bbox"], batch["agent/spd"]], dim=-1),
+        }
+        rollout_buffer = self.rollout(
+            features,
+            latent=latent_post,
+            goal=goal_gt,
+            goal_valid=goal_valid,
+            mask_teacher_forcing=self.teacher_forcing_reactive_replay.get(batch["gt/valid"], self.current_epoch),
+            rule_checker=rule_checker,
+            step_start=self.hparams.time_step_sim_start,
+            step_end=self.hparams.time_step_end,
+            deterministic_latent=True,
+            deterministic_action=True,
+            require_vis_dict=require_vis_dict,
+        )
+        rollout_buffer.flatten_repeat(1)
+
+        if self.global_rank == 0:
+            _pred_goal, _pred_dest = None, None
+            if self.model.goal_manager.goal_attr_mode == "dest":
+                _pred_dest = goal_pred.sample(True).unsqueeze(2)
+            elif self.model.goal_manager.goal_attr_mode == "goal_xy":
+                _pred_goal = goal_pred.sample(True).unsqueeze(2)
+            self.log_val_video(
+                prefix="reactive_replay",
+                batch_idx=batch_idx,
+                batch=batch,
+                buf=rollout_buffer,
+                pred_goal=_pred_goal,
+                pred_dest=_pred_dest,
+                attn_video=True,
+            )
 
     def validation_epoch_end(self, outputs):
         self.log("epoch", self.current_epoch, on_epoch=True)
@@ -813,7 +928,7 @@ class WaymoMotion(LightningModule):
         video_paths = []
         image_paths = []
         for idx in vis_eps_idx:
-            video_dir = f"video_{batch_idx}-{idx}"
+            video_dir = f"./videos/video_{batch_idx}-{idx}"
             _path = Path(video_dir)
             _path.mkdir(exist_ok=True, parents=True)
             episode_keys = [
@@ -855,7 +970,8 @@ class WaymoMotion(LightningModule):
                     "agent/yaw_bbox": buf.preds[idx, :, kf, buf.step_future_start :, [2]],
                     # [n_agent, n_step]
                     "speed": buf.preds[idx, :, kf, buf.step_future_start :, 3],
-                    "rew_dr": buf.diffbar_rewards[idx, :, kf, buf.step_future_start :],
+                    # EDIT: delete diffbar rewards
+                    # "rew_dr": buf.diffbar_rewards[idx, :, kf, buf.step_future_start :],
                     # [n_agent, n_step]
                     "lat_P": buf.latent_log_probs[idx, :, kf, buf.step_future_start :].float().exp(),
                     "act_P": buf.action_log_probs[idx, :, kf, buf.step_future_start :].float().exp(),
@@ -880,7 +996,7 @@ class WaymoMotion(LightningModule):
                 vis_waymo = VisWaymo(
                     episode["map/valid"], episode["map/type"], episode["map/pos"], episode["map/boundary"]
                 )
-                video_paths_pred = vis_waymo.save_prediction_videos(f"{video_dir}/{prefix}_K{kf}", episode, prediction)
+                video_paths_pred = vis_waymo.save_prediction_videos(f"{video_dir}/{prefix}_K{kf}", episode, prediction, save_agent_view=False)
                 video_paths += video_paths_pred
                 if attn_video:
                     video_paths_attn = vis_waymo.save_attn_videos(f"{video_dir}/{prefix}_K{kf}", episode, prediction)
@@ -900,7 +1016,7 @@ class WaymoMotion(LightningModule):
         return video_paths, image_paths
 
     def test_step(self, batch: Dict[str, Tensor], batch_idx: int) -> Dict:
-        require_vis_dict = False
+        require_vis_dict = True
         batch = self.pre_processing(batch)
         input_dict = {k.split("input/")[-1]: v for k, v in batch.items() if "input/" in k}
         latent_prior_dict = {k.split("latent_prior/")[-1]: v for k, v in batch.items() if "latent_prior/" in k}
@@ -967,10 +1083,769 @@ class WaymoMotion(LightningModule):
             "scheduler": hydra.utils.instantiate(self.hparams.lr_scheduler, optimizer=optimizer),
             "monitor": "val/loss",
             "interval": "epoch",
-            "frequency": self.trainer.check_val_every_n_epoch,
+            # "frequency": self.trainer.check_val_every_n_epoch,
             "strict": True,
         }
         return [optimizer], [scheduler]
 
     def log_grad_norm(self, grad_norm_dict: Dict[str, float]) -> None:
         self.log_dict(grad_norm_dict, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+
+    def manual_reactive_replay(self, batch: Dict[str, Tensor], batch_idx: int, log_video: bool=False) -> Dict:
+        require_vis_dict = True
+        batch = self.pre_processing(batch)
+        input_dict = {k.split("input/")[-1]: v for k, v in batch.items() if "input/" in k}
+        latent_post_dict = {k.split("latent_post/")[-1]: v for k, v in batch.items() if "latent_post/" in k}
+
+        input_feature_dict = self.model.encode_input_features(**input_dict)
+        latent_post_feature_dict = self.model.encode_input_features(**latent_post_dict)
+
+        # ! goal and destination
+        goal_gt, goal_valid = self.model.goal_manager.get_gt_goal(
+            agent_valid=input_dict["agent_valid"], gt_dest=batch["gt/dest"], gt_goal=batch["gt/goal"]
+        )
+
+        # ! latents
+        latent_post = self.model.latent_encoder(posterior=True, **latent_post_feature_dict)
+
+        rule_checker = TrafficRuleChecker(
+            batch["map/boundary"],
+            batch["map/valid"],
+            batch["map/type"],
+            batch["map/pos"],
+            batch["map/dir"],
+            batch["tl_stop/valid"],
+            batch["tl_stop/pos"],
+            batch["tl_stop/state"],
+            batch["agent/type"],
+            batch["agent/size"],
+            batch["agent/goal"],
+            batch["agent/dest"],
+            **self.hparams.traffic_rule_checker,
+        )
+        # prepare features
+        features = {
+            "map_valid": input_feature_dict["map_feature_valid"],
+            "map_feature": input_feature_dict["map_feature"],
+            "tl_valid": input_feature_dict["tl_feature_valid"],
+            "tl_feature": input_feature_dict["tl_feature"],
+            "agent_type": batch["sc/agent_type"],
+            "agent_size": batch["sc/agent_size"],
+            # gt states for overriding
+            "agent_valid": batch["agent/valid"],
+            "vel": batch["agent/vel"],
+            "acc": batch["agent/acc"],
+            "yaw_rate": batch["agent/yaw_rate"],
+            "agent_state": torch.cat([batch["agent/pos"], batch["agent/yaw_bbox"], batch["agent/spd"]], dim=-1),
+        }
+        
+        step_start = 11     # self.hparams.time_step_sim_start
+        step_end = 90       # self.hparams.time_step_end
+        step_current = 10   # self.hparams.time_step_current
+        # init buffer and policy
+        rollout_buffer = RolloutBuffer(
+            step_start=step_start, step_end=step_end, step_current=step_current
+        )
+        self.model.init(latent_post, True)
+        
+        # init with first frame
+        self.dynamics.init(
+            agent_valid=features["agent_valid"][:, step_current],
+            agent_state=features["agent_state"][:, step_current],
+            agent_type=features["agent_type"],
+            agent_size=features["agent_size"],
+            vel=features["vel"][:, step_current],
+            acc=features["acc"][:, step_current],
+            yaw_rate=features["yaw_rate"][:, step_current],
+        )
+        # encode goal
+        if self.model.goal_manager.dummy:
+            goal_feature = None
+        else:
+            goal_feature = self.model.goal_manager.get_goal_feature(
+                goal=goal_gt, as_state=self.dynamics.agent_state, map_feature=features["map_feature"]
+            )
+
+        # rollout
+        for _step in range(step_start, step_end + 1):
+            # prepare state_override: [n_batch, n_agent]
+            if _step >= features["agent_valid"].shape[1]:
+                mask_state_override = torch.zeros_like(self.teacher_forcing_reactive_replay.get(batch["gt/valid"], self.current_epoch)[:, 0])
+            else:
+                mask_state_override = self.teacher_forcing_reactive_replay.get(batch["gt/valid"], self.current_epoch)[:, _step]
+            state_override = None
+            if mask_state_override.any():
+                state_override = {k: features[k][:, _step] for k in self.dynamics.state_keys}
+
+            # predict _step, given _step-1, using last observered tl_state
+            step_tl = min(_step - 1, features["tl_valid"].shape[1] - 1)  # todo(maybe): could also use tl_state=UNKNOWN
+
+            if self.model.goal_manager.update_goal:
+                goal_feature = self.model.goal_manager.get_goal_feature(
+                    goal=goal_gt, as_state=self.dynamics.agent_state, map_feature=features["map_feature"]
+                )
+
+            # TODO:添加action相关动作
+            # mask_action_override = batch['agent/role'][:, :, 0].clone()
+            # action_override = torch.zeros((batch['agent/role'].shape[0], batch['agent/role'].shape[1], 2), dtype=torch.float)
+            # action_override[mask_action_override] = torch.tensor(self.controller.act(mask_action_override, self.dynamics.agent_state), dtype=torch.float)
+            
+            state_new, valid_new, train_dict, vis_dict = self.forward(
+                map_feature=features["map_feature"],
+                map_valid=features["map_valid"],
+                tl_feature=features["tl_feature"][:, step_tl],
+                tl_valid=features["tl_valid"][:, step_tl],
+                goal_feature=goal_feature,
+                goal_valid=goal_valid,
+                state_override=state_override,
+                mask_state_override=mask_state_override,
+                # action_override=action_override,
+                # mask_action_override=mask_action_override,
+                deterministic_action=True,
+                require_train_dict=True,
+                require_vis_dict=require_vis_dict,
+            )
+            # print(f"[{_step: 02d}]: ({self.dynamics.agent_state[0, 0, 0]}, {self.dynamics.agent_state[0, 0, 1]}) --|acc:{vis_dict['action'][0, 0, 0]} rot:{vis_dict['action'][0, 0, 1]}|--> ({state_new[0, 0, 0]}, {state_new[0, 0, 1]})")
+            # check violations, kill agents if outside map, update self.dynamics.agent_valid
+            _gt_valid = None if _step >= features["agent_valid"].shape[1] else features["agent_valid"][:, _step]
+            _gt_state = None if _step >= features["agent_valid"].shape[1] else features["agent_state"][:, _step]
+            violations = rule_checker.check(_step, valid_new, state_new)
+            self.dynamics.kill(violations, _gt_valid)
+            goal_valid = self.model.goal_manager.disable_goal_reached(
+                goal_valid=goal_valid,
+                agent_valid=self.dynamics.agent_valid,
+                dest_reached=violations["dest_reached"],
+                goal_reached=violations["goal_reached"],
+            )
+            # diffbar_reward
+            if self.train_metrics_train.use_diffbar_reward:
+                diffbar_reward, diffbar_reward_valid = self.diffbar_reward.get(
+                    agent_valid=train_dict["pred_valid"],
+                    agent_state=train_dict["pred_state"],
+                    gt_valid=_gt_valid,
+                    gt_state=_gt_state,
+                    agent_size=features["agent_size"],
+                )
+            else:
+                diffbar_reward, diffbar_reward_valid = None, None
+            # finish iteration by adding to buffer
+            rollout_buffer.add(
+                valid=train_dict["pred_valid"],
+                pred=train_dict["pred_state"],
+                override_mask=mask_state_override,
+                violation=violations,
+                diffbar_reward=diffbar_reward,
+                diffbar_reward_valid=diffbar_reward_valid,
+                latent_log_prob=train_dict["latent_log_prob"],
+                action_log_prob=train_dict["action_log_prob"],
+                vis_dict=vis_dict,
+            )
+        rollout_buffer.finish()
+        rollout_buffer.flatten_repeat(1)
+
+        if log_video:
+            self.log_val_video(
+                prefix="reactive_replay",
+                batch_idx=batch_idx,
+                batch=batch,
+                buf=rollout_buffer
+            )
+        return rollout_buffer
+
+    def manual_joint_future_pred(self, batch: Dict[str, Tensor], batch_idx: int, log_video: bool=False):
+
+        batch = self.pre_processing(batch)
+
+        input_dict = {k.split("input/")[-1]: v for k, v in batch.items() if "input/" in k}
+        latent_post_dict = {k.split("latent_post/")[-1]: v for k, v in batch.items() if "latent_post/" in k}
+        latent_prior_dict = {k.split("latent_prior/")[-1]: v for k, v in batch.items() if "latent_prior/" in k}
+
+        input_feature_dict = self.model.encode_input_features(**input_dict)
+        # latent_post_feature_dict = self.model.encode_input_features(**latent_post_dict)
+        latent_prior_feature_dict = self.model.encode_input_features(**latent_prior_dict)
+
+        # ! goal and destination
+        goal_gt, goal_valid = self.model.goal_manager.get_gt_goal(
+            agent_valid=input_dict["agent_valid"], gt_dest=batch["gt/dest"], gt_goal=batch["gt/goal"]
+        )
+        goal_pred = self.model.goal_manager.pred_goal(
+            agent_type=batch["ref/agent_type"],
+            map_type=batch["ref/map_type"],
+            agent_state=batch["ref/agent_state"],
+            **input_feature_dict,
+        )
+
+        # ! latents
+        # latent_post = self.model.latent_encoder(posterior=True, **latent_post_feature_dict)
+        latent_prior = self.model.latent_encoder(**latent_prior_feature_dict)
+
+        self.hparams.n_joint_future = 32
+        # ! joint_future_pred
+        rollout_buffer, goal_sample, goal_log_probs = self.joint_future_pred(
+            batch=batch,
+            input_feature_dict=input_feature_dict,
+            latent=latent_prior,
+            goal=goal_pred,
+            goal_valid=goal_valid,
+            require_vis_dict=True,
+        )
+
+        return rollout_buffer
+    
+    def ego_test_loop_for_validation(self, batch: Dict[str, Tensor], scenario, controller,* , 
+                      sim_duration: int=90, rule_checker: bool=False, visualize: bool=False, log_video: bool=False) -> Dict:
+        
+        batch = self.pre_processing(batch)
+
+        # 添加绘图模块
+        vis = Visualizer(scenario, batch['scenario_center'], batch['scenario_yaw'], activate=visualize)
+
+        input_dict = {k.split("input/")[-1]: v for k, v in batch.items() if "input/" in k}
+        latent_post_dict = {k.split("latent_post/")[-1]: v for k, v in batch.items() if "latent_post/" in k}
+
+        input_feature_dict = self.model.encode_input_features(**input_dict)
+        latent_post_feature_dict = self.model.encode_input_features(**latent_post_dict)
+
+        # ! goal and destination
+        goal_gt, goal_valid = self.model.goal_manager.get_gt_goal(
+            agent_valid=input_dict["agent_valid"], gt_dest=batch["gt/dest"], gt_goal=batch["gt/goal"]
+        )
+
+        # ! latents
+        latent_post = self.model.latent_encoder(posterior=True, **latent_post_feature_dict)
+
+        rule_checker = TrafficRuleChecker(
+            batch["map/boundary"],
+            batch["map/valid"],
+            batch["map/type"],
+            batch["map/pos"],
+            batch["map/dir"],
+            batch["tl_stop/valid"],
+            batch["tl_stop/pos"],
+            batch["tl_stop/state"],
+            batch["agent/type"],
+            batch["agent/size"],
+            batch["agent/goal"],
+            batch["agent/dest"],
+            enable_check_collided=rule_checker,
+            enable_check_run_road_edge=rule_checker,
+            enable_check_run_red_light=rule_checker,
+            enable_check_passive=rule_checker,
+        )
+        # prepare features
+        features = {
+            "map_valid": input_feature_dict["map_feature_valid"],
+            "map_feature": input_feature_dict["map_feature"],
+            "tl_valid": input_feature_dict["tl_feature_valid"],
+            "tl_feature": input_feature_dict["tl_feature"],
+            "agent_type": batch["sc/agent_type"],
+            "agent_size": batch["sc/agent_size"],
+            # gt states for overriding
+            "agent_valid": batch["agent/valid"],
+            "vel": batch["agent/vel"],
+            "acc": batch["agent/acc"],
+            "yaw_rate": batch["agent/yaw_rate"],
+            "agent_state": torch.cat([batch["agent/pos"], batch["agent/yaw_bbox"], batch["agent/spd"]], dim=-1),
+        }
+        
+        step_current = 0            # self.hparams.time_step_current
+        step_start = 1              # self.hparams.time_step_sim_start
+        step_end = sim_duration     # self.hparams.time_step_end
+        # init buffer and policy
+        rollout_buffer = RolloutBuffer(
+            step_start=step_start, step_end=step_end, step_current=step_current
+        )
+        self.model.init(latent_post, True)
+        
+        # init with first frame
+        self.dynamics.init(
+            agent_valid=features["agent_valid"][:, step_current],
+            agent_state=features["agent_state"][:, step_current],
+            agent_type=features["agent_type"],
+            agent_size=features["agent_size"],
+            vel=features["vel"][:, step_current],
+            acc=features["acc"][:, step_current],
+            yaw_rate=features["yaw_rate"][:, step_current],
+        )
+        # encode goal
+        if self.model.goal_manager.dummy:
+            goal_feature = None
+        else:
+            goal_feature = self.model.goal_manager.get_goal_feature(
+                goal=goal_gt, as_state=self.dynamics.agent_state, map_feature=features["map_feature"]
+            )
+
+        import time
+        tic = time.time()
+        # rollout
+        for _step in range(step_start, step_end + 1):
+            # prepare state_override: [n_batch, n_agent]
+            if _step >= features["agent_valid"].shape[1]:
+                mask_state_override = torch.zeros_like(self.teacher_forcing_reactive_replay.get(batch["gt/valid"], self.current_epoch)[:, 0])
+            else:
+                mask_state_override = self.teacher_forcing_reactive_replay.get(batch["gt/valid"], self.current_epoch)[:, _step]
+            state_override = None
+            if mask_state_override.any():
+                state_override = {k: features[k][:, _step] for k in self.dynamics.state_keys}
+
+            # predict _step, given _step-1, using last observered tl_state
+            step_tl = min(_step - 1, features["tl_valid"].shape[1] - 1)  # todo(maybe): could also use tl_state=UNKNOWN
+
+            if self.model.goal_manager.update_goal:
+                goal_feature = self.model.goal_manager.get_goal_feature(
+                    goal=goal_gt, as_state=self.dynamics.agent_state, map_feature=features["map_feature"]
+                )
+
+            # TODO:添加action相关动作
+            mask_action_override = batch['agent/role'][:, :, 0].clone()
+            action_override = torch.zeros((batch['agent/role'].shape[0], batch['agent/role'].shape[1], 2), dtype=torch.float)
+            action_override[mask_action_override] = torch.tensor(controller.act(mask_action_override, self.dynamics.agent_state), dtype=torch.float)
+            
+            state_new, valid_new, train_dict, vis_dict = self.forward(
+                map_feature=features["map_feature"],
+                map_valid=features["map_valid"],
+                tl_feature=features["tl_feature"][:, step_tl],
+                tl_valid=features["tl_valid"][:, step_tl],
+                goal_feature=goal_feature,
+                goal_valid=goal_valid,
+                state_override=state_override,
+                mask_state_override=mask_state_override,
+                action_override=action_override,
+                mask_action_override=mask_action_override,
+                deterministic_action=True,
+                require_train_dict=True,
+                require_vis_dict=True,
+            )
+            # print(f"[{_step: 02d}]: ({self.dynamics.agent_state[0, 0, 0]}, {self.dynamics.agent_state[0, 0, 1]}) --|acc:{vis_dict['action'][0, 0, 0]} rot:{vis_dict['action'][0, 0, 1]}|--> ({state_new[0, 0, 0]}, {state_new[0, 0, 1]})")
+            # check violations, kill agents if outside map, update self.dynamics.agent_valid
+            _gt_valid = None if _step >= features["agent_valid"].shape[1] else features["agent_valid"][:, _step]
+            _gt_state = None if _step >= features["agent_valid"].shape[1] else features["agent_state"][:, _step]
+            violations = rule_checker.check(_step, valid_new, state_new)
+            self.dynamics.kill(violations, _gt_valid)
+            goal_valid = self.model.goal_manager.disable_goal_reached(
+                goal_valid=goal_valid,
+                agent_valid=self.dynamics.agent_valid,
+                dest_reached=violations["dest_reached"],
+                goal_reached=violations["goal_reached"],
+            )
+
+            vis.update(train_dict["pred_state"], train_dict["pred_valid"])
+            
+            # finish iteration by adding to buffer
+            rollout_buffer.add(
+                valid=train_dict["pred_valid"],
+                pred=train_dict["pred_state"],
+                override_mask=mask_state_override,
+                violation=violations,
+                diffbar_reward=None,
+                diffbar_reward_valid=None,
+                latent_log_prob=train_dict["latent_log_prob"],
+                action_log_prob=train_dict["action_log_prob"],
+                vis_dict=vis_dict,
+            )
+        vis.close()
+
+        rollout_buffer.finish()
+        rollout_buffer.flatten_repeat(1)
+        
+        toc = time.time()
+        print(f"Average time use (per frame): {(toc-tic)/(step_end - step_start + 1)*1000: .3f} ms")
+
+        if log_video:
+            self.log_val_video(
+                prefix="reactive_replay",
+                batch_idx=0,
+                batch=batch,
+                buf=rollout_buffer
+            )
+        return rollout_buffer
+    
+    @staticmethod
+    def _print(message: str, activate: bool=True):
+        if activate:
+            print(message)
+
+    def ego_test_loop(self, origin_batch: Dict[str, Tensor], scenario, controller,* , 
+                      goal: tf.Tensor=None, sim_duration: int=90, k_futures: int=1, 
+                      print_info: bool=True, rule_checker: bool=False, 
+                      visualize: bool=False, video_path: str="") -> Dict:
+        
+        batch = copy.deepcopy(origin_batch)
+        batch = self.pre_processing(batch)
+
+        # 添加绘图模块
+        vis = Visualizer(scenario, batch['scenario_center'], batch['scenario_yaw'], activate=visualize)
+
+        input_dict = {k.split("input/")[-1]: v for k, v in batch.items() if "input/" in k}
+        latent_prior_dict = {k.split("latent_prior/")[-1]: v for k, v in batch.items() if "latent_prior/" in k}
+        input_feature_dict = self.model.encode_input_features(**input_dict)
+        latent_prior_feature_dict = self.model.encode_input_features(**latent_prior_dict)
+
+        # ! latents
+        latent_prior = self.model.latent_encoder(**latent_prior_feature_dict)
+
+        # ! joint_future_pred
+        for k in ["valid", "vel", "acc", "yaw_rate", "pos", "yaw_bbox", "spd", "size"]:
+            batch[f"agent/{k}"] = batch[f"history/agent/{k}"]
+
+        # deterministic tensor for goal and latent: K=0 is deterministic
+        deterministic = torch.zeros_like(batch["history/agent/valid"][:, 0])  # [n_batch, n_agent]
+        deterministic = deterministic.repeat_interleave(k_futures, 0)  # [n_batch*k_futures, n_agent]
+        deterministic[::k_futures] = True
+
+        # ! goal and destination
+        goal_valid = input_dict["agent_valid"].any(1)
+        if goal is not None:
+            goal_sample = torch.zeros(1, 64, dtype=torch.int64)
+            goal_sample[0, :len(goal)] = torch.tensor(goal)
+        else:
+            goal_pred = self.model.goal_manager.pred_goal(
+                agent_type=batch["ref/agent_type"],
+                map_type=batch["ref/map_type"],
+                agent_state=batch["ref/agent_state"],
+                **input_feature_dict,
+            )
+            goal_pred.repeat_interleave_(k_futures, 0)
+            goal_sample = goal_pred.sample(deterministic)
+            goal_log_probs = goal_pred.log_prob(goal_sample)
+            goal_valid = goal_valid.repeat_interleave(k_futures, 0)
+        
+        latent_prior.repeat_interleave_(k_futures, 0)
+
+        rule_checker_agent_dest = goal_sample
+        rule_checker_agent_goal = None
+
+        rule_checker = TrafficRuleChecker(
+            batch["map/boundary"].repeat_interleave(k_futures, 0),
+            batch["map/valid"].repeat_interleave(k_futures, 0),
+            batch["map/type"].repeat_interleave(k_futures, 0),
+            batch["map/pos"].repeat_interleave(k_futures, 0),
+            batch["map/dir"].repeat_interleave(k_futures, 0),
+            batch["history/tl_stop/valid"].repeat_interleave(k_futures, 0),
+            batch["history/tl_stop/pos"].repeat_interleave(k_futures, 0),
+            batch["history/tl_stop/state"].repeat_interleave(k_futures, 0),
+            batch["history/agent/type"].repeat_interleave(k_futures, 0),
+            batch["history/agent/size"].repeat_interleave(k_futures, 0),
+            rule_checker_agent_goal,  # ground truth goal
+            rule_checker_agent_dest,  # pred dest
+            enable_check_collided=rule_checker,
+            enable_check_run_road_edge=rule_checker,
+            enable_check_run_red_light=rule_checker,
+            enable_check_passive=rule_checker,
+        )
+
+        # prepare features
+        features = {
+            "map_valid": input_feature_dict["map_feature_valid"],
+            "map_feature": input_feature_dict["map_feature"],
+            "tl_valid": input_feature_dict["tl_feature_valid"],
+            "tl_feature": input_feature_dict["tl_feature"],
+            "agent_type": batch["sc/agent_type"],
+            "agent_size": batch["sc/agent_size"],
+            # gt states for overriding
+            "agent_valid": batch["agent/valid"],
+            "vel": batch["agent/vel"],
+            "acc": batch["agent/acc"],
+            "yaw_rate": batch["agent/yaw_rate"],
+            "agent_state": torch.cat([batch["agent/pos"], batch["agent/yaw_bbox"], batch["agent/spd"]], dim=-1),
+        }
+
+        for k in features.keys():
+            features[k] = features[k].repeat_interleave(k_futures, 0)
+        mask_teacher_forcing = self.teacher_forcing_joint_future_pred.get(features["agent_valid"], self.current_epoch)
+
+        step_current = 0            # self.hparams.time_step_current
+        step_start = 1              # self.hparams.time_step_sim_start
+        step_end = sim_duration     # self.hparams.time_step_end
+        # init buffer and policy
+        rollout_buffer = RolloutBuffer(
+            step_start=step_start, step_end=step_end, step_current=self.hparams.time_step_current
+        )
+        self.model.init(latent_prior, deterministic)
+        # init with first frame
+        self.dynamics.init(
+            agent_valid=features["agent_valid"][:, step_current],
+            agent_state=features["agent_state"][:, step_current],
+            agent_type=features["agent_type"],
+            agent_size=features["agent_size"],
+            vel=features["vel"][:, step_current],
+            acc=features["acc"][:, step_current],
+            yaw_rate=features["yaw_rate"][:, step_current],
+        )
+        # encode goal
+        goal_feature = self.model.goal_manager.get_goal_feature(
+            goal=goal_sample, as_state=self.dynamics.agent_state, map_feature=features["map_feature"]
+        )
+
+        tic = time.time()
+        # rollout
+        for _step in range(step_start, step_end + 1):
+            # prepare state_override: [n_batch, n_agent]
+            if _step >= features["agent_valid"].shape[1]:
+                mask_state_override = torch.zeros_like(mask_teacher_forcing[:, 0])
+            else:
+                mask_state_override = mask_teacher_forcing[:, _step]
+            state_override = None
+            if mask_state_override.any():
+                state_override = {k: features[k][:, _step] for k in self.dynamics.state_keys}
+
+            # predict _step, given _step-1, using last observered tl_state
+            step_tl = min(_step - 1, features["tl_valid"].shape[1] - 1)  # todo(maybe): could also use tl_state=UNKNOWN
+
+            if self.model.goal_manager.update_goal:
+                goal_feature = self.model.goal_manager.get_goal_feature(
+                    goal=goal_sample, as_state=self.dynamics.agent_state, map_feature=features["map_feature"]
+                )
+            
+            # EDIT:添加action相关动作
+            control_info = controller.act(self.dynamics.agent_state, self.dynamics.agent_size, self.dynamics.agent_valid)
+            self._print(f"frame {_step}: [acc={control_info[0]: .3f}, rot={control_info[1]: .3f}]", activate=print_info)
+            mask_action_override = batch['ref/agent_role'][:, :, 0].clone()
+            action_override = torch.zeros((batch['ref/agent_role'].shape[0], batch['ref/agent_role'].shape[1], 2), dtype=torch.float)
+            action_override[mask_action_override] = torch.tensor(control_info, dtype=torch.float)
+            
+            state_new, valid_new, train_dict, vis_dict = self.forward(
+                map_feature=features["map_feature"],
+                map_valid=features["map_valid"],
+                tl_feature=features["tl_feature"][:, step_tl],
+                tl_valid=features["tl_valid"][:, step_tl],
+                goal_feature=goal_feature,
+                goal_valid=goal_valid,
+                state_override=state_override,
+                mask_state_override=mask_state_override,
+                action_override=action_override,
+                mask_action_override=mask_action_override,
+                deterministic_action=deterministic,
+                require_train_dict=True,
+                require_vis_dict=False,
+            )
+
+            # check violations, kill agents if outside map, update self.dynamics.agent_valid
+            _gt_valid = None if _step >= features["agent_valid"].shape[1] else features["agent_valid"][:, _step]
+            _gt_state = None if _step >= features["agent_valid"].shape[1] else features["agent_state"][:, _step]
+            violations = rule_checker.check(_step, valid_new, state_new)
+            self.dynamics.kill(violations, _gt_valid)
+            goal_valid = self.model.goal_manager.disable_goal_reached(
+                goal_valid=goal_valid,
+                agent_valid=self.dynamics.agent_valid,
+                dest_reached=violations["dest_reached"],
+                goal_reached=violations["goal_reached"],
+            )
+
+            vis.update(train_dict["pred_state"], train_dict["pred_valid"])
+
+            # finish iteration by adding to buffer
+            rollout_buffer.add(
+                valid=train_dict["pred_valid"],
+                pred=train_dict["pred_state"],
+                override_mask=mask_state_override,
+                violation=violations,
+                diffbar_reward=None,
+                diffbar_reward_valid=None,
+                latent_log_prob=train_dict["latent_log_prob"],
+                action_log_prob=train_dict["action_log_prob"],
+                vis_dict=vis_dict,
+            )
+        vis.close(save_path=video_path)
+
+        rollout_buffer.finish()
+        rollout_buffer.flatten_repeat(1)
+        
+        toc = time.time()
+        
+        self._print('-' * 50, activate=print_info)
+        self._print(f"Totol time use ({step_end - step_start + 1} frames): {toc-tic: .2f} s", activate=print_info)
+        self._print(f"Average time use (per frame): {(toc-tic)/(step_end - step_start + 1)*1000: .3f} ms", activate=print_info)
+
+        return rollout_buffer
+
+    def ego_test_loop_for_onsite(self, origin_batch: Dict[str, Tensor], controller,* , 
+                      goal: tf.Tensor=None, sim_duration: int=90, k_futures: int=1, 
+                      print_info: bool=True, rule_checker: bool=False) -> Dict:
+        
+        batch = copy.deepcopy(origin_batch)
+        batch = self.pre_processing(batch)
+
+        input_dict = {k.split("input/")[-1]: v for k, v in batch.items() if "input/" in k}
+        latent_prior_dict = {k.split("latent_prior/")[-1]: v for k, v in batch.items() if "latent_prior/" in k}
+        input_feature_dict = self.model.encode_input_features(**input_dict)
+        latent_prior_feature_dict = self.model.encode_input_features(**latent_prior_dict)
+
+        # ! latents
+        latent_prior = self.model.latent_encoder(**latent_prior_feature_dict)
+
+        # ! joint_future_pred
+        for k in ["valid", "vel", "acc", "yaw_rate", "pos", "yaw_bbox", "spd", "size"]:
+            batch[f"agent/{k}"] = batch[f"history/agent/{k}"]
+
+        # deterministic tensor for goal and latent: K=0 is deterministic
+        deterministic = torch.zeros_like(batch["history/agent/valid"][:, 0])  # [n_batch, n_agent]
+        deterministic = deterministic.repeat_interleave(k_futures, 0)  # [n_batch*k_futures, n_agent]
+        deterministic[::k_futures] = True
+
+        # ! goal and destination
+        goal_valid = input_dict["agent_valid"].any(1)
+        if goal is not None:
+            goal_sample = torch.zeros(1, 64, dtype=torch.int64)
+            goal_sample[0, :len(goal)] = torch.tensor(goal)
+        else:
+            goal_pred = self.model.goal_manager.pred_goal(
+                agent_type=batch["ref/agent_type"],
+                map_type=batch["ref/map_type"],
+                agent_state=batch["ref/agent_state"],
+                **input_feature_dict,
+            )
+            goal_pred.repeat_interleave_(k_futures, 0)
+            goal_sample = goal_pred.sample(deterministic)
+            goal_log_probs = goal_pred.log_prob(goal_sample)
+            goal_valid = goal_valid.repeat_interleave(k_futures, 0)
+        
+        latent_prior.repeat_interleave_(k_futures, 0)
+
+        rule_checker_agent_dest = goal_sample
+        rule_checker_agent_goal = None
+
+        rule_checker = TrafficRuleChecker(
+            batch["map/boundary"].repeat_interleave(k_futures, 0),
+            batch["map/valid"].repeat_interleave(k_futures, 0),
+            batch["map/type"].repeat_interleave(k_futures, 0),
+            batch["map/pos"].repeat_interleave(k_futures, 0),
+            batch["map/dir"].repeat_interleave(k_futures, 0),
+            batch["history/tl_stop/valid"].repeat_interleave(k_futures, 0),
+            batch["history/tl_stop/pos"].repeat_interleave(k_futures, 0),
+            batch["history/tl_stop/state"].repeat_interleave(k_futures, 0),
+            batch["history/agent/type"].repeat_interleave(k_futures, 0),
+            batch["history/agent/size"].repeat_interleave(k_futures, 0),
+            rule_checker_agent_goal,  # ground truth goal
+            rule_checker_agent_dest,  # pred dest
+            enable_check_collided=rule_checker,
+            enable_check_run_road_edge=rule_checker,
+            enable_check_run_red_light=rule_checker,
+            enable_check_passive=rule_checker,
+        )
+
+        # prepare features
+        features = {
+            "map_valid": input_feature_dict["map_feature_valid"],
+            "map_feature": input_feature_dict["map_feature"],
+            "tl_valid": input_feature_dict["tl_feature_valid"],
+            "tl_feature": input_feature_dict["tl_feature"],
+            "agent_type": batch["sc/agent_type"],
+            "agent_size": batch["sc/agent_size"],
+            # gt states for overriding
+            "agent_valid": batch["agent/valid"],
+            "vel": batch["agent/vel"],
+            "acc": batch["agent/acc"],
+            "yaw_rate": batch["agent/yaw_rate"],
+            "agent_state": torch.cat([batch["agent/pos"], batch["agent/yaw_bbox"], batch["agent/spd"]], dim=-1),
+        }
+
+        for k in features.keys():
+            features[k] = features[k].repeat_interleave(k_futures, 0)
+        mask_teacher_forcing = self.teacher_forcing_joint_future_pred.get(features["agent_valid"], self.current_epoch)
+
+        step_current = 0            # self.hparams.time_step_current
+        step_start = 1              # self.hparams.time_step_sim_start
+        step_end = sim_duration     # self.hparams.time_step_end
+        # init buffer and policy
+        rollout_buffer = RolloutBuffer(
+            step_start=step_start, step_end=step_end, step_current=self.hparams.time_step_current
+        )
+        self.model.init(latent_prior, deterministic)
+        # init with first frame
+        self.dynamics.init(
+            agent_valid=features["agent_valid"][:, step_current],
+            agent_state=features["agent_state"][:, step_current],
+            agent_type=features["agent_type"],
+            agent_size=features["agent_size"],
+            vel=features["vel"][:, step_current],
+            acc=features["acc"][:, step_current],
+            yaw_rate=features["yaw_rate"][:, step_current],
+        )
+        # encode goal
+        goal_feature = self.model.goal_manager.get_goal_feature(
+            goal=goal_sample, as_state=self.dynamics.agent_state, map_feature=features["map_feature"]
+        )
+
+        tic = time.time()
+        # rollout
+        for _step in range(step_start, step_end + 1):
+            # prepare state_override: [n_batch, n_agent]
+            if _step >= features["agent_valid"].shape[1]:
+                mask_state_override = torch.zeros_like(mask_teacher_forcing[:, 0])
+            else:
+                mask_state_override = mask_teacher_forcing[:, _step]
+            state_override = None
+            if mask_state_override.any():
+                state_override = {k: features[k][:, _step] for k in self.dynamics.state_keys}
+
+            # predict _step, given _step-1, using last observered tl_state
+            step_tl = min(_step - 1, features["tl_valid"].shape[1] - 1)  # todo(maybe): could also use tl_state=UNKNOWN
+
+            if self.model.goal_manager.update_goal:
+                goal_feature = self.model.goal_manager.get_goal_feature(
+                    goal=goal_sample, as_state=self.dynamics.agent_state, map_feature=features["map_feature"]
+                )
+            
+            # EDIT:添加action相关动作
+            control_info = controller.act(self.dynamics.agent_state, self.dynamics.agent_size, self.dynamics.agent_valid)
+            self._print(f"frame {_step}: [acc={control_info[0]: .3f}, rot={control_info[1]: .3f}]", activate=print_info)
+            mask_action_override = batch['ref/agent_role'][:, :, 0].clone()
+            action_override = torch.zeros((batch['ref/agent_role'].shape[0], batch['ref/agent_role'].shape[1], 2), dtype=torch.float)
+            action_override[mask_action_override] = torch.tensor(control_info, dtype=torch.float)
+            
+            state_new, valid_new, train_dict, vis_dict = self.forward(
+                map_feature=features["map_feature"],
+                map_valid=features["map_valid"],
+                tl_feature=features["tl_feature"][:, step_tl],
+                tl_valid=features["tl_valid"][:, step_tl],
+                goal_feature=goal_feature,
+                goal_valid=goal_valid,
+                state_override=state_override,
+                mask_state_override=mask_state_override,
+                action_override=action_override,
+                mask_action_override=mask_action_override,
+                deterministic_action=deterministic,
+                require_train_dict=True,
+                require_vis_dict=True,
+            )
+
+            # check violations, kill agents if outside map, update self.dynamics.agent_valid
+            # _gt_valid = None if _step >= features["agent_valid"].shape[1] else features["agent_valid"][:, _step]
+            # EDIT: 防止主车被kill掉，对gt_valid进行限制
+            _gt_valid = torch.zeros_like(batch['history/agent/valid'][:, 0]) if _step >= features["agent_valid"].shape[1] else features["agent_valid"][:, _step]
+            _gt_valid[0, 0] = True
+            
+            _gt_state = None if _step >= features["agent_valid"].shape[1] else features["agent_state"][:, _step]
+            violations = rule_checker.check(_step, valid_new, state_new)
+            self.dynamics.kill(violations, _gt_valid)
+            goal_valid = self.model.goal_manager.disable_goal_reached(
+                goal_valid=goal_valid,
+                agent_valid=self.dynamics.agent_valid,
+                dest_reached=violations["dest_reached"],
+                goal_reached=violations["goal_reached"],
+            )
+
+            # finish iteration by adding to buffer
+            rollout_buffer.add(
+                valid=train_dict["pred_valid"],
+                pred=train_dict["pred_state"],
+                override_mask=mask_state_override,
+                violation=violations,
+                diffbar_reward=None,
+                diffbar_reward_valid=None,
+                latent_log_prob=train_dict["latent_log_prob"],
+                action_log_prob=train_dict["action_log_prob"],
+                vis_dict=vis_dict,
+            )
+
+        rollout_buffer.finish()
+        rollout_buffer.flatten_repeat(1)
+        
+        toc = time.time()
+        
+        self._print('-' * 50, activate=print_info)
+        self._print(f"Totol time use ({step_end - step_start + 1} frames): {toc-tic: .2f} s", activate=print_info)
+        self._print(f"Average time use (per frame): {(toc-tic)/(step_end - step_start + 1)*1000: .3f} ms", activate=print_info)
+
+        return rollout_buffer

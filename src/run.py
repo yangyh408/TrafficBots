@@ -1,12 +1,12 @@
 # Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by-nc/4.0/)
 import hydra
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from typing import List
 from pytorch_lightning import seed_everything, LightningDataModule, LightningModule, Trainer, Callback
 from pytorch_lightning.loggers import LightningLoggerBase
 import os
-
+# os.environ['NUMEXPR_MAX_THREADS'] = '24'
 
 def download_checkpoint(loggers, wb_ckpt) -> None:
     if os.environ.get("LOCAL_RANK", 0) == 0:
@@ -16,8 +16,13 @@ def download_checkpoint(loggers, wb_ckpt) -> None:
 
 @hydra.main(config_path="../configs/", config_name="run.yaml")
 def main(config: DictConfig) -> None:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../configs/export_conf.yaml'), 'w') as f:
+        print(OmegaConf.to_yaml(config), file=f)
 
+    # 设置随机数种子
     seed_everything(config.seed, workers=True)
+    # 组织和管理数据加载
+    # hydra.utils.instantiate 函数是 Hydra 提供的一个实用函数，用于实例化给定类或模块，并根据配置文件中的参数初始化实例。
     datamodule: LightningDataModule = hydra.utils.instantiate(config.datamodule)
 
     callbacks: List[Callback] = []

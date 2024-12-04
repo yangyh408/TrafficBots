@@ -8,7 +8,7 @@ import h5py
 import numpy as np
 from pathlib import Path
 from waymo_open_dataset.protos import scenario_pb2
-import src.utils.pack_h5 as pack_utils
+import utils.pack_h5 as pack_utils
 import tensorflow as tf
 
 # Licensed under the CC BY-NC 4.0 license (https://creativecommons.org/licenses/by-nc/4.0/)

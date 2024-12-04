@@ -448,7 +448,7 @@ class VisWaymo:
                         v[0].append(agent_view)
 
         for k, v in buffer_video.items():
-            encoder = ImageEncoder(k, v[0][0].shape, 20, 20)
+            encoder = ImageEncoder(k, v[0][0].shape, 10, 10)
             for im in v[0]:
                 encoder.capture_frame(im)
             encoder.close()

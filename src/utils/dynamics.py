@@ -158,7 +158,8 @@ class Dynamics:
         Update: will take affect at next update(), at t
             self.as_valid: [n_batch, n_agent], bool
         """
-        mask_kill = traffic_rule_violations["outside_map_this_step"]
+        # EDIT: add condition to kill the agent outside the road edge
+        mask_kill = traffic_rule_violations["outside_map_this_step"] | traffic_rule_violations["run_road_edge_this_step"]
         if gt_valid is not None:  # do not kill agent that has gt_valid, such that the value can be computed at t+1.
             mask_kill = mask_kill & (~gt_valid)
         if mask_kill.any():

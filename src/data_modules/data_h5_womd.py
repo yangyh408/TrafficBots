@@ -170,9 +170,12 @@ class DataH5womd(LightningDataModule):
             "agent_no_sim/size": (n_agent_no_sim, 3),  # float32: [length, width, height]
         }
 
+        # 将train, test中的配置键值加入到val中
         self.tensor_size_val = self.tensor_size_val | self.tensor_size_train | self.tensor_size_test
 
     def setup(self, stage: Optional[str] = None) -> None:
+    # make assignments here (val/train/test split)
+    # called on every process in DDP
         if stage == "fit" or stage is None:
             self.train_dataset = DatasetTrain(self.path_train_h5, self.tensor_size_train)
             self.val_dataset = DatasetVal(self.path_val_h5, self.tensor_size_val)
@@ -196,8 +199,8 @@ class DataH5womd(LightningDataModule):
             ds,
             batch_size=batch_size,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=False,
             shuffle=False,
             drop_last=False,
-            persistent_workers=True,
+            persistent_workers=True,    # 在每个epoch结束时数据加载工作进程是否持续存在，设置为True时可以提高加载速度
         )

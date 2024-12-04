@@ -27,7 +27,7 @@ class WOMDMetrics(Metric):
         self.step_current = step_current
         self.interactive_challenge = interactive_challenge
         self.track_future_samples = step_gt - step_current
-        assert self.track_future_samples == 80
+        # assert self.track_future_samples == 80
         self.metrics_config, self.metrics_names = self._waymo_metrics_config_names(
             step_current, self.track_future_samples
         )

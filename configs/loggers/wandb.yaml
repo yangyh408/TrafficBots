@@ -1,9 +1,9 @@
 wandb:
   _target_: pytorch_lightning.loggers.WandbLogger
-  project: debug
+  project: traffic_bots
   group: null
-  name: my_name
+  name: local run
   notes: my_notes
   tags: []
   job_type: train
-  entity: YOUR_ENTITY
+  entity: yangyh408
